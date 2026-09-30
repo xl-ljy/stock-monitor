@@ -1,117 +1,91 @@
-import os
 import requests
+import os
+import json
 
-# 1. 微信推送配置
-SEND_KEY = os.environ.get("SCT_KEY", "YOUR_SEND_KEY_HERE")  # 从环境变量读取 SendKey
+# 1. 获取微信推送秘钥
+SCT_KEY = os.environ.get("SCT_KEY", "")
 
-# 2. 监控标的预设关键位点策略
-STRATEGY = {
-    "sh601899": {
-        "name": "紫金矿业",
-        "buy_1": 29.00,      # 第一补仓买点
-        "buy_2": 28.20,      # 第二强支撑买点
-        "sell_1": 30.00,     # 第一做T高抛点
-        "sell_2": 31.20,     # 第二压力点
-    },
-    "sh512880": {
-        "name": "证券ETF国泰",
-        "buy_1": 1.025,
-        "buy_2": 1.020,
-        "sell_1": 1.050,
-        "sell_2": 1.070,
-    },
-    "sh603888": {
-        "name": "新华网",
-        "buy_1": 17.00,
-        "buy_2": 16.80,
-        "sell_1": 17.80,
-        "sell_2": 19.00,
-    }
+# 2. 你的自选股票池 (sh代表上交所, sz代表深交所)
+STOCKS = {
+    'sh601899': '紫金矿业',
+    'sh512880': '证券ETF国泰',
+    'sh603888': '新华网'
 }
 
-def fetch_stock_data():
-    """实时获取新浪财经股票/ETF数据"""
-    symbols = ",".join(STRATEGY.keys())
-    url = f"https://hq.sinajs.cn/list={symbols}"
-    headers = {"Referer": "https://finance.sina.com.cn"}
+def analyze_stock(symbol, name):
+    # 调用新浪财经接口获取最新带有均线(MA5, MA10, MA20)的日K数据
+    url = f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=5,10,20&datalen=1"
     
-    response = requests.get(url, headers=headers)
-    response.encoding = 'gbk'
-    lines = response.text.strip().split("\n")
-    
-    results = {}
-    for line in lines:
-        if '="' not in line:
-            continue
-        code = line.split('var hq_str_')[1].split('=')[0]
-        data_str = line.split('"')[1]
-        if not data_str:
-            continue
-        parts = data_str.split(',')
-        name = parts[0]
-        yesterday_close = float(parts[2])
-        current_price = float(parts[3])
-        high = float(parts[4])
-        low = float(parts[5])
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()[0] # 提取今天的最新数据
         
-        # 计算涨跌幅
-        change_pct = ((current_price - yesterday_close) / yesterday_close) * 100 if yesterday_close else 0
-        results[code] = {
-            "name": name,
-            "current": current_price,
-            "change_pct": change_pct,
-            "high": high,
-            "low": low
-        }
-    return results
+        current_price = float(data['close'])
+        # 获取接口自动算好的均价
+        ma5 = float(data.get('ma_price5', current_price))
+        ma10 = float(data.get('ma_price10', current_price))
+        ma20 = float(data.get('ma_price20', current_price))
+        
+        # 整理均线字典
+        mas = {'5日均线': ma5, '10日均线': ma10, '20日均线': ma20}
+        
+        # 筛选支撑位(在现价下方)和压力位(在现价上方)
+        supports = {k: v for k, v in mas.items() if v < current_price}
+        pressures = {k: v for k, v in mas.items() if v > current_price}
+        
+        # 计算做T买点（最靠近现价下方的均线支撑）
+        if supports:
+            # 找到数值最大的那条支撑线(离现价最近)
+            buy_line_name = max(supports, key=supports.get)
+            buy_price = supports[buy_line_name]
+            buy_msg = f"{buy_line_name} ({buy_price:.3f}元)"
+        else:
+            # 如果跌破所有均线，默认用现价下浮2%作为左侧极限买点
+            buy_price = current_price * 0.98
+            buy_msg = f"所有均线跌破，参考下浮2% ({buy_price:.3f}元)"
+            
+        # 计算做T卖点（最靠近现价上方的均线压力）
+        if pressures:
+            # 找到数值最小的那条压力线(离现价最近)
+            sell_line_name = min(pressures, key=pressures.get)
+            sell_price = pressures[sell_line_name]
+            sell_msg = f"{sell_line_name} ({sell_price:.3f}元)"
+        else:
+            # 如果突破所有均线，默认用现价上浮2%作为止盈卖点
+            sell_price = current_price * 1.02
+            sell_msg = f"强势突破均线，参考上浮2% ({sell_price:.3f}元)"
 
-def generate_report(data):
-    """根据最新行情生成微信推送的 Markdown 简报"""
-    msg = "## 📊 每日持仓自动化监控报告\n\n"
-    
-    for code, info in STRATEGY.items():
-        if code not in data:
-            continue
-        stock_info = data[code]
-        curr_price = stock_info["current"]
-        pct = stock_info["change_pct"]
+        # 组装单只股票的微信推送文本
+        text = f"### 🔹 {name} ({symbol[2:]})\n\n"
+        text += f"- **当前价格**: {current_price:.3f} 元\n"
+        text += f"- **🟢 做T买点 (低吸)**: 建议在 **{buy_msg}** 附近挂单买入\n"
+        text += f"- **🔴 做T卖点 (高抛)**: 建议在 **{sell_msg}** 附近挂单卖出\n"
+        text += f"- *(今日指标参考: MA5={ma5:.3f}, MA10={ma10:.3f}, MA20={ma20:.3f})*\n\n"
+        text += "---\n\n"
+        return text
         
-        msg += f"### 🔹 {stock_info['name']} ({code[2:]})\n"
-        msg += f"- **最新现价**：`{curr_price:.3f}` 元 (涨跌幅: `{pct:+.2f}%`)\n"
-        msg += f"- **今日最高/最低**：`{stock_info['high']:.3f}` / `{stock_info['low']:.3f}`\n"
-        
-        # 判断买卖建议
-        actions = []
-        if curr_price <= info["buy_2"]:
-            actions.append(f"🚨 **极度低估/强支撑**：已触发第二买点区（<={info['buy_2']}元），建议重仓低吸补仓！")
-        elif curr_price <= info["buy_1"]:
-            actions.append(f"🟢 **到达买点区**：位于第一买点区间（<={info['buy_1']}元），建议分批挂单买入。")
-            
-        if curr_price >= info["sell_2"]:
-            actions.append(f"🔥 **强压力突破**：已到达第二止盈位（>={info['sell_2']}元），建议大部队清仓/重度减仓。")
-        elif curr_price >= info["sell_1"]:
-            actions.append(f"🟡 **到达高抛区**：触及第一压力位（>={info['sell_1']}元），建议将前期低吸筹码做T卖出。")
-            
-        if not actions:
-            actions.append("⚪ **观望区间**：价格处于通道中部，未触发设定的买卖条件单，保持持仓即可。")
-            
-        for act in actions:
-            msg += f"- {act}\n"
-        msg += "\n---\n"
-        
-    return msg
+    except Exception as e:
+        return f"### 🔹 {name} 自动分析失败，请检查代码或网络\n\n---\n\n"
 
-def push_to_wechat(title, content):
-    """通过 Server 酱发送微信消息"""
-    url = f"https://sctapi.ftqq.com/{SEND_KEY}.send"
-    payload = {
-        "title": title,
-        "desp": content
+def main():
+    if not SCT_KEY:
+        print("未获取到 SCT_KEY 密钥，无法推送到微信！")
+        return
+        
+    report_content = "## 📉 均线动态做T自动化建议\n\n"
+    
+    # 遍历计算每一只股票
+    for symbol, name in STOCKS.items():
+        report_content += analyze_stock(symbol, name)
+        
+    # 发送到微信 (Server酱)
+    send_url = f"https://sctapi.ftqq.com/{SCT_KEY}.send"
+    data = {
+        "title": "股票每日做T自动化建议",
+        "desp": report_content
     }
-    res = requests.get(url, params=payload)
-    print("推送结果:", res.json())
+    requests.post(send_url, data=data)
+    print("推送任务执行完毕！")
 
 if __name__ == "__main__":
-    stock_data = fetch_stock_data()
-    report = generate_report(stock_data)
-    push_to_wechat("📈 股票买卖触发条件监控提醒", report)
+    main()
